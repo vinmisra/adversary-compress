@@ -1,6 +1,5 @@
 """
-Code for "Generative Adversarial Networks". Please cite the ArXiv paper in
-any published research work making use of this code.
+Code for compressive adversarial network implementation. Based on "Generative Adversarial Networks", by Goodfellow et alÏ
 """
 import functools
 wraps = functools.wraps
@@ -27,77 +26,38 @@ from pylearn2.utils import safe_zip
 from pylearn2.utils import serial
 from pylearn2.utils import sharedX
 
-class AdversaryPair(Model):
+class CompressAdversaryPair(Model):
 
-    def __init__(self, generator, discriminator, inferer=None,
-                 inference_monitoring_batch_size=128,
-                 monitor_generator=True,
-                 monitor_discriminator=True,
-                 monitor_inference=True,
-                 shrink_d = 0.):
+    def __init__(self, compressor, discriminator):
         Model.__init__(self)
         self.__dict__.update(locals())
         del self.self
 
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        if 'inferer' not in state:
-            self.inferer = None
-        if 'inference_monitoring_batch_size' not in state:
-            self.inference_monitoring_batch_size = 128  # TODO: HACK
-        if 'monitor_generator' not in state:
-            self.monitor_generator = True
-        if 'monitor_discriminator' not in state:
-            self.monitor_discriminator = True
-        if 'monitor_inference' not in state:
-            self.monitor_inference = True
-
     def get_params(self):
-        p = self.generator.get_params() + self.discriminator.get_params()
-        if hasattr(self, 'inferer') and self.inferer is not None:
-            p += self.inferer.get_params()
+        p = self.compressor.get_params() + self.discriminator.get_params()
         return p
 
     def get_input_space(self):
-        return self.discriminator.get_input_space()
-
-    def get_weights_topo(self):
-        return self.discriminator.get_weights_topo()
-
-    def get_weights(self):
-        return self.discriminator.get_weights()
-
-    def get_weights_format(self):
-        return self.discriminator.get_weights_format()
-
-    def get_weights_view_shape(self):
-        return self.discriminator.get_weights_view_shape()
+        return self.compressor.get_input_space()
 
     def get_monitoring_channels(self, data):
         rval = OrderedDict()
 
-        g_ch = self.generator.get_monitoring_channels(data)
-        d_ch = self.discriminator.get_monitoring_channels((data, None))
-        samples = self.generator.sample(100)
-        d_samp_ch = self.discriminator.get_monitoring_channels((samples, None))
+        X,Y = data
+        Xhat = self.compressor.fprop(X)
 
-        i_ch = OrderedDict()
-        if self.inferer is not None:
-            batch_size = self.inference_monitoring_batch_size
-            sample, noise, _ = self.generator.sample_and_noise(batch_size)
-            i_ch.update(self.inferer.get_monitoring_channels((sample, noise)))
+        c_ch = self.compressor.get_monitoring_channels(X)
+        d_ch = self.discriminator.get_monitoring_channels((X,Y))
+        d_distorted_ch = self.discriminator.get_monitoring_channels((Xhat, Y))
 
-        if self.monitor_generator:
-            for key in g_ch:
-                rval['gen_' + key] = g_ch[key]
+        if self.monitor_compressor:
+            for key in c_ch:
+                rval['compress_' + key] = c_ch[key]
         if self.monitor_discriminator:
             for key in d_ch:
-                rval['dis_on_data_' + key] = d_samp_ch[key]
+                rval['dis_on_data_' + key] = d_ch[key]
             for key in d_ch:
-                rval['dis_on_samp_' + key] = d_ch[key]
-        if self.monitor_inference:
-            for key in i_ch:
-                rval['inf_' + key] = i_ch[key]
+                rval['dis_on_distorted_' + key] = d_distorted_ch[key]
         return rval
 
     def get_monitoring_data_specs(self):
@@ -107,131 +67,42 @@ class AdversaryPair(Model):
         return (space, source)
 
     def _modify_updates(self, updates):
-        self.generator.modify_updates(updates)
+        self.compressor.modify_updates(updates)
         self.discriminator.modify_updates(updates)
-        if self.shrink_d != 0.:
-            for param in self.discriminator.get_params():
-                if param in updates:
-                    updates[param] = self.shrink_d * updates[param]
-        if self.inferer is not None:
-            self.inferer.modify_updates(updates)
 
     def get_lr_scalers(self):
-
-        rval = self.generator.get_lr_scalers()
+        rval = self.compressor.get_lr_scalers()
         rval.update(self.discriminator.get_lr_scalers())
         return rval
 
-def add_layers(mlp, pretrained, start_layer=0):
-    model = serial.load(pretrained)
-    pretrained_layers = model.generator.mlp.layers
-    assert pretrained_layers[start_layer].get_input_space() == mlp.layers[-1].get_output_space()
-    mlp.layers.extend(pretrained_layers[start_layer:])
-    return mlp
+class compressor(Model):
+    #very simple wrapper around MLP
 
-
-
-class Generator(Model):
-
-    def __init__(self, mlp, noise = "gaussian", monitor_ll = False, ll_n_samples = 100, ll_sigma = 0.2):
+    def __init__(self, mlp):
         Model.__init__(self)
         self.__dict__.update(locals())
         del self.self
-        self.theano_rng = MRG_RandomStreams(2014 * 5 + 27)
+        self.theano_rng = MRG_RandomStreams(2015 * 4 * 20)
 
     def get_input_space(self):
         return self.mlp.get_input_space()
 
-    def sample_and_noise(self, num_samples, default_input_include_prob=1., default_input_scale=1., all_g_layers=False):
-        n = self.mlp.get_input_space().get_total_dimension()
-        noise = self.get_noise((num_samples, n))
-        formatted_noise = VectorSpace(n).format_as(noise, self.mlp.get_input_space())
-        if all_g_layers:
-            rval = self.mlp.dropout_fprop(formatted_noise, default_input_include_prob=default_input_include_prob, default_input_scale=default_input_scale, return_all=all_g_layers)
-            other_layers, rval = rval[:-1], rval[-1]
-        else:
-            rval = self.mlp.dropout_fprop(formatted_noise, default_input_include_prob=default_input_include_prob, default_input_scale=default_input_scale)
-            other_layers = None
-        return rval, formatted_noise, other_layers
-
-    def sample(self, num_samples, default_input_include_prob=1., default_input_scale=1.):
-        sample, _, _ = self.sample_and_noise(num_samples, default_input_include_prob, default_input_scale)
-        return sample
-
-    def inpainting_sample_and_noise(self, X, default_input_include_prob=1., default_input_scale=1.):
-        # Very hacky! Specifically for inpainting right half of CIFAR-10 given left half
-        # assumes X is b01c
-        assert X.ndim == 4
-        input_space = self.mlp.get_input_space()
-        n = input_space.get_total_dimension()
-        image_size = input_space.shape[0]
-        half_image = int(image_size / 2)
-        data_shape = (X.shape[0], image_size, half_image, input_space.num_channels)
-
-        noise = self.theano_rng.normal(size=data_shape, dtype='float32')
-        Xg = T.set_subtensor(X[:,:,half_image:,:], noise)
-        sampled_part, noise =  self.mlp.dropout_fprop(Xg, default_input_include_prob=default_input_include_prob, default_input_scale=default_input_scale), noise
-        sampled_part = sampled_part.reshape(data_shape)
-        rval = T.set_subtensor(X[:, :, half_image:, :], sampled_part)
-        return rval, noise
-
+    def reconstruct(self, input):
+        return self.mlp.fprop(input)
 
     def get_monitoring_channels(self, data):
-        if data is None:
-            m = 100
-        else:
-            m = data.shape[0]
-        n = self.mlp.get_input_space().get_total_dimension()
-        noise = self.get_noise((m, n))
         rval = OrderedDict()
-
         try:
-            rval.update(self.mlp.get_monitoring_channels((noise, None)))
+            rval.update(self.mlp.get_monitoring_channels(data))
         except Exception:
-            warnings.warn("something went wrong with generator.mlp's monitoring channels")
-
-        if  self.monitor_ll:
-            rval['ll'] = T.cast(self.ll(data, self.ll_n_samples, self.ll_sigma),
-                                        theano.config.floatX).mean()
-            rval['nll'] = -rval['ll']
+            warnings.warn("something went wrong with compressor.mlp's monitoring channels")
         return rval
-
-    def get_noise(self, size):
-
-        # Allow just requesting batch size
-        if isinstance(size, int):
-            size = (size, self.get_input_space().get_total_dimension())
-
-        if not hasattr(self, 'noise'):
-            self.noise = "gaussian"
-        if self.noise == "uniform":
-            return self.theano_rng.uniform(low=-np.sqrt(3), high=np.sqrt(3), size=size, dtype='float32')
-        elif self.noise == "gaussian":
-            return self.theano_rng.normal(size=size, dtype='float32')
-        elif self.noise == "spherical":
-            noise = self.theano_rng.normal(size=size, dtype='float32')
-            noise = noise / T.maximum(1e-7, T.sqrt(T.sqr(noise).sum(axis=1))).dimshuffle(0, 'x')
-            return noise
-        else:
-            raise NotImplementedError(self.noise)
 
     def get_params(self):
         return self.mlp.get_params()
 
     def get_output_space(self):
         return self.mlp.get_output_space()
-
-    def ll(self, data, n_samples, sigma):
-
-        samples = self.sample(n_samples)
-        output_space = self.mlp.get_output_space()
-        if 'Conv2D' in str(output_space):
-            samples = output_space.convert(samples, output_space.axes, ('b', 0, 1, 'c'))
-            samples = samples.flatten(2)
-            data = output_space.convert(data, output_space.axes, ('b', 0, 1, 'c'))
-            data = data.flatten(2)
-        parzen = theano_parzen(data, samples, sigma)
-        return parzen
 
     def _modify_updates(self, updates):
         self.mlp.modify_updates(updates)
@@ -241,55 +112,28 @@ class Generator(Model):
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        if 'monitor_ll' not in state:
-            self.monitor_ll = False
 
+class AdversaryCost_VeracityPrecision(DefaultDataSpecsMixin, Cost):
 
-class IntrinsicDropoutGenerator(Generator):
-    def __init__(self, default_input_include_prob, default_input_scale,
-                        input_include_probs=None, input_scales=None, **kwargs):
-        super(IntrinsicDropoutGenerator, self).__init__(**kwargs)
-        self.__dict__.update(locals())
-        del self.self
-
-    def sample_and_noise(self, num_samples, default_input_include_prob=1., default_input_scale=1., all_g_layers=False):
-        if all_g_layers:
-            raise NotImplementedError()
-        n = self.mlp.get_input_space().get_total_dimension()
-        noise = self.theano_rng.normal(size=(num_samples, n), dtype='float32')
-        formatted_noise = VectorSpace(n).format_as(noise, self.mlp.get_input_space())
-        # ignores dropout args
-        default_input_include_prob = self.default_input_include_prob
-        default_input_scale = self.default_input_scale
-        input_include_probs = self.input_include_probs
-        input_scales = self.input_scales
-        return self.mlp.dropout_fprop(formatted_noise,
-                                      default_input_include_prob=default_input_include_prob,
-                                      default_input_scale=default_input_scale,
-                                      input_include_probs=input_include_probs,
-                                      input_scales=input_scales), formatted_noise, None
-
-class AdversaryCost2(DefaultDataSpecsMixin, Cost):
-    """
-    """
-
-    # Supplies own labels, don't get them from the dataset
-    supervised = False
+    # Combination of both internally generated labels (true or fake --- veracity) and ground truth labels (number betwen 0 and 9 if true --- precision)
+    # 11 total categories: fake, and 0-9.
+    # generator seeks to max p(d(fake)=label), while discriminator seeks to max p(d(.)=.)
+    supervised = True
 
     def __init__(self, scale_grads=1, target_scale=.1,
             discriminator_default_input_include_prob = 1.,
             discriminator_input_include_probs=None,
             discriminator_default_input_scale=1.,
             discriminator_input_scales=None,
-            generator_default_input_include_prob = 1.,
-            generator_default_input_scale=1.,
+            compressor_default_input_include_prob = 1.,
+            compressor_default_input_scale=1.,
             inference_default_input_include_prob=None,
             inference_input_include_probs=None,
             inference_default_input_scale=1.,
             inference_input_scales=None,
-            init_now_train_generator=True,
+            init_now_train_compressor=True,
             ever_train_discriminator=True,
-            ever_train_generator=True,
+            ever_train_compressor=True,
             ever_train_inference=True,
             no_drop_in_d_for_g=False,
             alternate_g = False,
@@ -303,7 +147,7 @@ class AdversaryCost2(DefaultDataSpecsMixin, Cost):
         # These allow you to dynamically switch off training parts.
         # If the corresponding ever_train_* is False, these have
         # no effect.
-        self.now_train_generator = sharedX(init_now_train_generator)
+        self.now_train_compressor = sharedX(init_now_train_compressor)
         self.now_train_discriminator = sharedX(numpy.array(1., dtype='float32'))
         self.now_train_inference = sharedX(numpy.array(1., dtype='float32'))
 
@@ -314,7 +158,7 @@ class AdversaryCost2(DefaultDataSpecsMixin, Cost):
         # it.
         if self.ever_train_discriminator:
             l.append(d_obj)
-        if self.ever_train_generator:
+        if self.ever_train_compressor:
             l.append(g_obj)
         if self.ever_train_inference:
             l.append(i_obj)
@@ -324,7 +168,7 @@ class AdversaryCost2(DefaultDataSpecsMixin, Cost):
         space, sources = self.get_data_specs(model)
         space.validate(data)
         assert isinstance(model, AdversaryPair)
-        g = model.generator
+        g = model.compressor
         d = model.discriminator
 
         # Note: this assumes data is design matrix
@@ -334,7 +178,7 @@ class AdversaryCost2(DefaultDataSpecsMixin, Cost):
         y0 = T.alloc(0, m, 1)
         # NOTE: if this changes to optionally use dropout, change the inference
         # code below to use a non-dropped-out version.
-        S, z, other_layers = g.sample_and_noise(m, default_input_include_prob=self.generator_default_input_include_prob, default_input_scale=self.generator_default_input_scale, all_g_layers=(self.infer_layer is not None))
+        S, z, other_layers = g.sample_and_noise(m, default_input_include_prob=self.compressor_default_input_include_prob, default_input_scale=self.compressor_default_input_scale, all_g_layers=(self.infer_layer is not None))
 
         if self.noise_both != 0.:
             rng = MRG_RandomStreams(2014 / 6 + 2)
@@ -383,7 +227,7 @@ class AdversaryCost2(DefaultDataSpecsMixin, Cost):
         space, sources = self.get_data_specs(model)
         space.validate(data)
         assert isinstance(model, AdversaryPair)
-        g = model.generator
+        g = model.compressor
         d = model.discriminator
 
         S, d_obj, g_obj, i_obj = self.get_samples_and_objectives(model, data)
@@ -408,8 +252,8 @@ class AdversaryCost2(DefaultDataSpecsMixin, Cost):
             rval.update(OrderedDict(safe_zip(d_params, [self.now_train_discriminator * dg for dg in d_grads])))
         else:
             rval.update(OrderedDict(zip(d_params, zeros)))
-        if self.ever_train_generator:
-            rval.update(OrderedDict(safe_zip(g_params, [self.now_train_generator * gg for gg in g_grads])))
+        if self.ever_train_compressor:
+            rval.update(OrderedDict(safe_zip(g_params, [self.now_train_compressor * gg for gg in g_grads])))
         else:
             rval.update(OrderedDict(zip(g_params, zeros)))
         if self.ever_train_inference and model.inferer is not None:
@@ -423,7 +267,7 @@ class AdversaryCost2(DefaultDataSpecsMixin, Cost):
 
         # Two d steps for every g step
         if self.alternate_g:
-            updates[self.now_train_generator] = 1. - self.now_train_generator
+            updates[self.now_train_compressor] = 1. - self.now_train_compressor
 
         return rval, updates
 
@@ -433,7 +277,7 @@ class AdversaryCost2(DefaultDataSpecsMixin, Cost):
 
         m = data.shape[0]
 
-        g = model.generator
+        g = model.compressor
         d = model.discriminator
 
         y_hat = d.fprop(data)
@@ -452,10 +296,10 @@ class AdversaryCost2(DefaultDataSpecsMixin, Cost):
             rval['objective_i'] = i_obj
         if model.monitor_discriminator:
             rval['objective_d'] = d_obj
-        if model.monitor_generator:
+        if model.monitor_compressor:
             rval['objective_g'] = g_obj
 
-        rval['now_train_generator'] = self.now_train_generator
+        rval['now_train_compressor'] = self.now_train_compressor
         return rval
 
 def recapitate_discriminator(pair_path, new_head):
@@ -561,7 +405,7 @@ class Sum(Layer):
 def marginals(dataset):
     return dataset.X.mean(axis=0)
 
-class ActivateGenerator(TrainExtension):
+class Activatecompressor(TrainExtension):
     def __init__(self, active_after, value=1.):
         self.__dict__.update(locals())
         del self.self
@@ -569,7 +413,7 @@ class ActivateGenerator(TrainExtension):
 
     def on_monitor(self, model, dataset, algorithm):
         if self.cur_epoch == self.active_after:
-            algorithm.cost.now_train_generator.set_value(np.array(self.value, dtype='float32'))
+            algorithm.cost.now_train_compressor.set_value(np.array(self.value, dtype='float32'))
         self.cur_epoch += 1
 
 class InpaintingAdversaryCost(DefaultDataSpecsMixin, Cost):
@@ -584,15 +428,15 @@ class InpaintingAdversaryCost(DefaultDataSpecsMixin, Cost):
             discriminator_input_include_probs=None,
             discriminator_default_input_scale=1.,
             discriminator_input_scales=None,
-            generator_default_input_include_prob = 1.,
-            generator_default_input_scale=1.,
+            compressor_default_input_include_prob = 1.,
+            compressor_default_input_scale=1.,
             inference_default_input_include_prob=None,
             inference_input_include_probs=None,
             inference_default_input_scale=1.,
             inference_input_scales=None,
-            init_now_train_generator=True,
+            init_now_train_compressor=True,
             ever_train_discriminator=True,
-            ever_train_generator=True,
+            ever_train_compressor=True,
             ever_train_inference=True,
             no_drop_in_d_for_g=False,
             alternate_g = False):
@@ -601,7 +445,7 @@ class InpaintingAdversaryCost(DefaultDataSpecsMixin, Cost):
         # These allow you to dynamically switch off training parts.
         # If the corresponding ever_train_* is False, these have
         # no effect.
-        self.now_train_generator = sharedX(init_now_train_generator)
+        self.now_train_compressor = sharedX(init_now_train_compressor)
         self.now_train_discriminator = sharedX(numpy.array(1., dtype='float32'))
         self.now_train_inference = sharedX(numpy.array(1., dtype='float32'))
 
@@ -613,7 +457,7 @@ class InpaintingAdversaryCost(DefaultDataSpecsMixin, Cost):
         space, sources = self.get_data_specs(model)
         space.validate(data)
         assert isinstance(model, AdversaryPair)
-        g = model.generator
+        g = model.compressor
         d = model.discriminator
 
         # Note: this assumes data is b01c
@@ -624,7 +468,7 @@ class InpaintingAdversaryCost(DefaultDataSpecsMixin, Cost):
         y0 = T.alloc(0, m, 1)
         # NOTE: if this changes to optionally use dropout, change the inference
         # code below to use a non-dropped-out version.
-        S, z = g.inpainting_sample_and_noise(X, default_input_include_prob=self.generator_default_input_include_prob, default_input_scale=self.generator_default_input_scale)
+        S, z = g.inpainting_sample_and_noise(X, default_input_include_prob=self.compressor_default_input_include_prob, default_input_scale=self.compressor_default_input_scale)
         y_hat1 = d.dropout_fprop(X, self.discriminator_default_input_include_prob,
                                      self.discriminator_input_include_probs,
                                      self.discriminator_default_input_scale,
@@ -660,7 +504,7 @@ class InpaintingAdversaryCost(DefaultDataSpecsMixin, Cost):
         space, sources = self.get_data_specs(model)
         space.validate(data)
         assert isinstance(model, AdversaryPair)
-        g = model.generator
+        g = model.compressor
         d = model.discriminator
 
         S, d_obj, g_obj, i_obj = self.get_samples_and_objectives(model, data)
@@ -685,8 +529,8 @@ class InpaintingAdversaryCost(DefaultDataSpecsMixin, Cost):
         else:
             rval.update(OrderedDict(zip(d_params, itertools.repeat(theano.tensor.constant(0., dtype='float32')))))
 
-        if self.ever_train_generator:
-            rval.update(OrderedDict(safe_zip(g_params, [self.now_train_generator * gg for gg in g_grads])))
+        if self.ever_train_compressor:
+            rval.update(OrderedDict(safe_zip(g_params, [self.now_train_compressor * gg for gg in g_grads])))
         else:
             rval.update(OrderedDict(zip(g_params, itertools.repeat(theano.tensor.constant(0., dtype='float32')))))
 
@@ -699,7 +543,7 @@ class InpaintingAdversaryCost(DefaultDataSpecsMixin, Cost):
 
         # Two d steps for every g step
         if self.alternate_g:
-            updates[self.now_train_generator] = 1. - self.now_train_generator
+            updates[self.now_train_compressor] = 1. - self.now_train_compressor
 
         return rval, updates
 
@@ -709,7 +553,7 @@ class InpaintingAdversaryCost(DefaultDataSpecsMixin, Cost):
 
         m = data.shape[0]
 
-        g = model.generator
+        g = model.compressor
         d = model.discriminator
 
         y_hat = d.fprop(data)
@@ -729,7 +573,7 @@ class InpaintingAdversaryCost(DefaultDataSpecsMixin, Cost):
         rval['objective_d'] = d_obj
         rval['objective_g'] = g_obj
 
-        rval['now_train_generator'] = self.now_train_generator
+        rval['now_train_compressor'] = self.now_train_compressor
         return rval
 
 class Cycler(object):
@@ -741,7 +585,7 @@ class Cycler(object):
 
     def __call__(self, sgd):
         self.i = (self.i + 1) % self.k
-        sgd.cost.now_train_generator.set_value(np.cast['float32'](self.i == 0))
+        sgd.cost.now_train_compressor.set_value(np.cast['float32'](self.i == 0))
 
 class NoiseCat(Layer):
 
@@ -881,15 +725,15 @@ class ThresholdedAdversaryCost(DefaultDataSpecsMixin, Cost):
             discriminator_input_include_probs=None,
             discriminator_default_input_scale=1.,
             discriminator_input_scales=None,
-            generator_default_input_include_prob = 1.,
-            generator_default_input_scale=1.,
+            compressor_default_input_include_prob = 1.,
+            compressor_default_input_scale=1.,
             inference_default_input_include_prob=None,
             inference_input_include_probs=None,
             inference_default_input_scale=1.,
             inference_input_scales=None,
-            init_now_train_generator=True,
+            init_now_train_compressor=True,
             ever_train_discriminator=True,
-            ever_train_generator=True,
+            ever_train_compressor=True,
             ever_train_inference=True,
             no_drop_in_d_for_g=False,
             alternate_g = False,
@@ -900,7 +744,7 @@ class ThresholdedAdversaryCost(DefaultDataSpecsMixin, Cost):
         # These allow you to dynamically switch off training parts.
         # If the corresponding ever_train_* is False, these have
         # no effect.
-        self.now_train_generator = sharedX(init_now_train_generator)
+        self.now_train_compressor = sharedX(init_now_train_compressor)
         self.now_train_discriminator = sharedX(numpy.array(1., dtype='float32'))
         self.now_train_inference = sharedX(numpy.array(1., dtype='float32'))
 
@@ -911,7 +755,7 @@ class ThresholdedAdversaryCost(DefaultDataSpecsMixin, Cost):
         # it.
         if self.ever_train_discriminator:
             l.append(d_obj)
-        if self.ever_train_generator:
+        if self.ever_train_compressor:
             l.append(g_obj)
         if self.ever_train_inference:
             l.append(i_obj)
@@ -921,7 +765,7 @@ class ThresholdedAdversaryCost(DefaultDataSpecsMixin, Cost):
         space, sources = self.get_data_specs(model)
         space.validate(data)
         assert isinstance(model, AdversaryPair)
-        g = model.generator
+        g = model.compressor
         d = model.discriminator
 
         # Note: this assumes data is design matrix
@@ -931,7 +775,7 @@ class ThresholdedAdversaryCost(DefaultDataSpecsMixin, Cost):
         y0 = T.alloc(0, m, 1)
         # NOTE: if this changes to optionally use dropout, change the inference
         # code below to use a non-dropped-out version.
-        S, z, other_layers = g.sample_and_noise(m, default_input_include_prob=self.generator_default_input_include_prob, default_input_scale=self.generator_default_input_scale, all_g_layers=(self.infer_layer is not None))
+        S, z, other_layers = g.sample_and_noise(m, default_input_include_prob=self.compressor_default_input_include_prob, default_input_scale=self.compressor_default_input_scale, all_g_layers=(self.infer_layer is not None))
 
         if self.noise_both != 0.:
             rng = MRG_RandomStreams(2014 / 6 + 2)
@@ -984,7 +828,7 @@ class ThresholdedAdversaryCost(DefaultDataSpecsMixin, Cost):
         space, sources = self.get_data_specs(model)
         space.validate(data)
         assert isinstance(model, AdversaryPair)
-        g = model.generator
+        g = model.compressor
         d = model.discriminator
 
         S, d_obj, g_obj, i_obj = self.get_samples_and_objectives(model, data)
@@ -1009,8 +853,8 @@ class ThresholdedAdversaryCost(DefaultDataSpecsMixin, Cost):
             rval.update(OrderedDict(safe_zip(d_params, [self.now_train_discriminator * dg for dg in d_grads])))
         else:
             rval.update(OrderedDict(zip(d_params, zeros)))
-        if self.ever_train_generator:
-            rval.update(OrderedDict(safe_zip(g_params, [self.now_train_generator * gg for gg in g_grads])))
+        if self.ever_train_compressor:
+            rval.update(OrderedDict(safe_zip(g_params, [self.now_train_compressor * gg for gg in g_grads])))
         else:
             rval.update(OrderedDict(zip(g_params, zeros)))
         if self.ever_train_inference and model.inferer is not None:
@@ -1024,7 +868,7 @@ class ThresholdedAdversaryCost(DefaultDataSpecsMixin, Cost):
 
         # Two d steps for every g step
         if self.alternate_g:
-            updates[self.now_train_generator] = 1. - self.now_train_generator
+            updates[self.now_train_compressor] = 1. - self.now_train_compressor
 
         return rval, updates
 
@@ -1034,7 +878,7 @@ class ThresholdedAdversaryCost(DefaultDataSpecsMixin, Cost):
 
         m = data.shape[0]
 
-        g = model.generator
+        g = model.compressor
         d = model.discriminator
 
         y_hat = d.fprop(data)
@@ -1053,10 +897,10 @@ class ThresholdedAdversaryCost(DefaultDataSpecsMixin, Cost):
             rval['objective_i'] = i_obj
         if model.monitor_discriminator:
             rval['objective_d'] = d_obj
-        if model.monitor_generator:
+        if model.monitor_compressor:
             rval['objective_g'] = g_obj
 
-        rval['now_train_generator'] = self.now_train_generator
+        rval['now_train_compressor'] = self.now_train_compressor
         return rval
 
 
@@ -1098,15 +942,15 @@ class LazyAdversaryCost(DefaultDataSpecsMixin, Cost):
             discriminator_input_include_probs=None,
             discriminator_default_input_scale=1.,
             discriminator_input_scales=None,
-            generator_default_input_include_prob = 1.,
-            generator_default_input_scale=1.,
+            compressor_default_input_include_prob = 1.,
+            compressor_default_input_scale=1.,
             inference_default_input_include_prob=None,
             inference_input_include_probs=None,
             inference_default_input_scale=1.,
             inference_input_scales=None,
-            init_now_train_generator=True,
+            init_now_train_compressor=True,
             ever_train_discriminator=True,
-            ever_train_generator=True,
+            ever_train_compressor=True,
             ever_train_inference=True,
             no_drop_in_d_for_g=False,
             alternate_g = False,
@@ -1119,7 +963,7 @@ class LazyAdversaryCost(DefaultDataSpecsMixin, Cost):
         # These allow you to dynamically switch off training parts.
         # If the corresponding ever_train_* is False, these have
         # no effect.
-        self.now_train_generator = sharedX(init_now_train_generator)
+        self.now_train_compressor = sharedX(init_now_train_compressor)
         self.now_train_discriminator = sharedX(numpy.array(1., dtype='float32'))
         self.now_train_inference = sharedX(numpy.array(1., dtype='float32'))
 
@@ -1130,7 +974,7 @@ class LazyAdversaryCost(DefaultDataSpecsMixin, Cost):
         # it.
         if self.ever_train_discriminator:
             l.append(d_obj)
-        if self.ever_train_generator:
+        if self.ever_train_compressor:
             l.append(g_obj)
         if self.ever_train_inference:
             l.append(i_obj)
@@ -1140,7 +984,7 @@ class LazyAdversaryCost(DefaultDataSpecsMixin, Cost):
         space, sources = self.get_data_specs(model)
         space.validate(data)
         assert isinstance(model, AdversaryPair)
-        g = model.generator
+        g = model.compressor
         d = model.discriminator
 
         # Note: this assumes data is design matrix
@@ -1150,7 +994,7 @@ class LazyAdversaryCost(DefaultDataSpecsMixin, Cost):
         y0 = T.alloc(0, m, 1)
         # NOTE: if this changes to optionally use dropout, change the inference
         # code below to use a non-dropped-out version.
-        S, z, other_layers = g.sample_and_noise(m, default_input_include_prob=self.generator_default_input_include_prob, default_input_scale=self.generator_default_input_scale, all_g_layers=(self.infer_layer is not None))
+        S, z, other_layers = g.sample_and_noise(m, default_input_include_prob=self.compressor_default_input_include_prob, default_input_scale=self.compressor_default_input_scale, all_g_layers=(self.infer_layer is not None))
 
         if self.noise_both != 0.:
             rng = MRG_RandomStreams(2014 / 6 + 2)
@@ -1214,7 +1058,7 @@ class LazyAdversaryCost(DefaultDataSpecsMixin, Cost):
         space, sources = self.get_data_specs(model)
         space.validate(data)
         assert isinstance(model, AdversaryPair)
-        g = model.generator
+        g = model.compressor
         d = model.discriminator
 
         S, d_obj, g_obj, i_obj = self.get_samples_and_objectives(model, data)
@@ -1239,8 +1083,8 @@ class LazyAdversaryCost(DefaultDataSpecsMixin, Cost):
             rval.update(OrderedDict(safe_zip(d_params, [self.now_train_discriminator * dg for dg in d_grads])))
         else:
             rval.update(OrderedDict(zip(d_params, zeros)))
-        if self.ever_train_generator:
-            rval.update(OrderedDict(safe_zip(g_params, [self.now_train_generator * gg for gg in g_grads])))
+        if self.ever_train_compressor:
+            rval.update(OrderedDict(safe_zip(g_params, [self.now_train_compressor * gg for gg in g_grads])))
         else:
             rval.update(OrderedDict(zip(g_params, zeros)))
         if self.ever_train_inference and model.inferer is not None:
@@ -1254,7 +1098,7 @@ class LazyAdversaryCost(DefaultDataSpecsMixin, Cost):
 
         # Two d steps for every g step
         if self.alternate_g:
-            updates[self.now_train_generator] = 1. - self.now_train_generator
+            updates[self.now_train_compressor] = 1. - self.now_train_compressor
 
         return rval, updates
 
@@ -1264,7 +1108,7 @@ class LazyAdversaryCost(DefaultDataSpecsMixin, Cost):
 
         m = data.shape[0]
 
-        g = model.generator
+        g = model.compressor
         d = model.discriminator
 
         y_hat = d.fprop(data)
@@ -1283,8 +1127,8 @@ class LazyAdversaryCost(DefaultDataSpecsMixin, Cost):
             rval['objective_i'] = i_obj
         if model.monitor_discriminator:
             rval['objective_d'] = d_obj
-        if model.monitor_generator:
+        if model.monitor_compressor:
             rval['objective_g'] = g_obj
 
-        rval['now_train_generator'] = self.now_train_generator
+        rval['now_train_compressor'] = self.now_train_compressor
         return rval
