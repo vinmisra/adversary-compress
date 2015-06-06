@@ -2,13 +2,15 @@ import sys, os, pdb
 import train_AE
 import CAN
 from pylearn2.config import yaml_parse
+import matplotlib
+matplotlib.use('Agg')
 
 #command line input is name of experiment
 NAME = sys.argv[1]
 
 #path constants
 #DATA_DIR = "/Users/vmisra/data" #local
-DATA_DIR = "/users/ubuntu/data" #AWS
+DATA_DIR = "/home/ubuntu/data" #AWS
 MODELS_DIR = os.path.join(DATA_DIR,"CAN_experiments/models",NAME)
 SAVE_MODEL_PATH = os.path.join(MODELS_DIR,NAME+".pkl")
 SAVE_YAML_PATH = os.path.join(MODELS_DIR,NAME+".yaml")
